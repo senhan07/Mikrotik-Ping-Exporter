@@ -1,0 +1,12 @@
+mikrotik:
+  host: 192.168.3.1      # Your MikroTik IP
+  user: user
+  password: user
+
+targets:
+  - name: "google-dns"
+    ip: "google.com"
+    count: 5
+  - name: "cloudflare"
+    ip: "cloudflare.com" 
+    count: 5
