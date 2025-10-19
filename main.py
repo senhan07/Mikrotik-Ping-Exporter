@@ -10,6 +10,12 @@ import queue
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from contextlib import contextmanager
+from cryptography.fernet import Fernet
+
+# Load key for decryption
+with open("secret.key", "rb") as key_file:
+    key = key_file.read()
+f = Fernet(key)
 
 # Load config
 with open('config.yml', 'r') as f:
@@ -17,8 +23,8 @@ with open('config.yml', 'r') as f:
 
 SSH_HOST = config['mikrotik']['host']
 SSH_USER = config['mikrotik']['user']
-SSH_PASS = config['mikrotik']['password']
-MAX_SSH_CONNECTIONS = int(config.get('max_ssh_connections', 10))
+SSH_PASS = f.decrypt(config['mikrotik']['password'].encode()).decode()
+MAX_SSH_CONNECTIONS = 10
 
 # --- SSH Connection Pooling ---
 class MikroTikSSHConnection:
@@ -211,28 +217,35 @@ class ProbeHandler(BaseHTTPRequestHandler):
         # Create a temporary registry for this request
         probe_registry = CollectorRegistry()
 
+        label_keys = ['target'] + list(dynamic_labels.keys())
+        label_values = [target] + list(dynamic_labels.values())
+
         # Define metrics for the temporary registry
-        ping_rtt_probe = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', registry=probe_registry)
-        ping_up_probe = Gauge('mikrotik_ping_up', 'Target is reachable', registry=probe_registry)
-        ping_ttl_probe = Gauge('mikrotik_ping_ttl', 'Time-to-live', registry=probe_registry)
-        ping_size_probe = Gauge('mikrotik_ping_size_bytes', 'Packet size', registry=probe_registry)
+        ping_rtt_probe = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', label_keys, registry=probe_registry)
+        ping_up_probe = Gauge('mikrotik_ping_up', 'Target is reachable', label_keys, registry=probe_registry)
+        ping_ttl_probe = Gauge('mikrotik_ping_ttl', 'Time-to-live', label_keys, registry=probe_registry)
+        ping_size_probe = Gauge('mikrotik_ping_size_bytes', 'Packet size', label_keys, registry=probe_registry)
         probe_duration_probe = Gauge('mikrotik_probe_duration_seconds', 'Probe duration', registry=probe_registry)
-        target_ip_probe = Info('mikrotik_target_ip_address', 'Resolved IP address of target', registry=probe_registry)
+        target_ip_probe = Info('mikrotik_target_ip_address', 'Resolved IP address of target', label_keys, registry=probe_registry)
 
         # Populate temporary metrics
-        ping_rtt_probe.set(result['rtt_sec'])
-        ping_up_probe.set(result['up'])
-        ping_ttl_probe.set(result['ttl'])
-        ping_size_probe.set(result['size'])
+        ping_rtt_probe.labels(*label_values).set(result['rtt_sec'])
+        ping_up_probe.labels(*label_values).set(result['up'])
+        ping_ttl_probe.labels(*label_values).set(result['ttl'])
+        ping_size_probe.labels(*label_values).set(result['size'])
         probe_duration_probe.set(result['duration'])
-        target_ip_probe.info({'ip': resolved_ip})
+        target_ip_probe.labels(*label_values).info({'ip': resolved_ip})
 
         PROBE_DURATION.set(result['duration'])
 
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain; version=0.0.4')
         self.end_headers()
-        self.wfile.write(generate_latest(probe_registry))
+        try:
+            self.wfile.write(generate_latest(probe_registry))
+        except ConnectionAbortedError:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Client closed connection early for target {target}")
+            return
 
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         status = '🟢' if result['up'] else '🔴'
