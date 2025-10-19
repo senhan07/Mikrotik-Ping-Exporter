@@ -4,27 +4,12 @@ import time
 import re
 import socket
 from prometheus_client import Gauge, Info, generate_latest, CollectorRegistry, Metric
-import yaml
+import argparse
 import threading
 import queue
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from contextlib import contextmanager
-from cryptography.fernet import Fernet
-
-# Load key for decryption
-with open("secret.key", "rb") as key_file:
-    key = key_file.read()
-f = Fernet(key)
-
-# Load config
-with open('config.yml', 'r') as f:
-    config = yaml.safe_load(f)
-
-SSH_HOST = config['mikrotik']['host']
-SSH_USER = config['mikrotik']['user']
-SSH_PASS = f.decrypt(config['mikrotik']['password'].encode()).decode()
-MAX_SSH_CONNECTIONS = 10
 
 # --- SSH Connection Pooling ---
 class MikroTikSSHConnection:
@@ -56,14 +41,17 @@ class MikroTikSSHConnection:
         raise ConnectionError("SSH connection is not active.")
 
 class MikroTikSSHConnectionPool:
-    def __init__(self, max_connections):
+    def __init__(self, host, user, password, max_connections=10):
+        self.host = host
+        self.user = user
+        self.password = password
         self.max_connections = max_connections
         self._pool = queue.Queue(maxsize=max_connections)
         for _ in range(max_connections):
             self._pool.put(self._create_connection())
 
     def _create_connection(self):
-        return MikroTikSSHConnection(SSH_HOST, SSH_USER, SSH_PASS)
+        return MikroTikSSHConnection(self.host, self.user, self.password)
 
     @contextmanager
     def connection(self):
@@ -281,13 +269,20 @@ def run_server(prober, collector, port=9642):
     httpd.serve_forever()
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='MikroTik Ping Exporter')
+    parser.add_argument('--host', required=True, help='MikroTik host')
+    parser.add_argument('--user', required=True, help='MikroTik user')
+    parser.add_argument('--password', required=True, help='MikroTik password')
+    parser.add_argument('--port', type=int, default=9642, help='Port to listen on')
+    args = parser.parse_args()
+
     try:
         print("🚀 Starting MikroTik Ping Exporter...")
         collector = MikroTikCollector()
         GLOBAL_REGISTRY.register(collector)
-        ssh_pool = MikroTikSSHConnectionPool(max_connections=MAX_SSH_CONNECTIONS)
+        ssh_pool = MikroTikSSHConnectionPool(args.host, args.user, args.password)
         prober = MikroTikPingProber(ssh_pool)
-        run_server(prober, collector, 9642)
+        run_server(prober, collector, args.port)
     except Exception as e:
         import traceback
         with open("error.log", "w") as f:

@@ -6,7 +6,7 @@ This is a high-performance, concurrent Prometheus exporter for running ping test
 
 - **High Concurrency:** Uses a pool of SSH connections to run many ping tests in parallel, suitable for monitoring hundreds of targets.
 - **Dynamic Labels:** Supports passing arbitrary labels to the exporter via URL parameters, similar to the official Blackbox Exporter.
-- **Secure Configuration:** Includes a utility to encrypt the MikroTik password, so it is not stored in plaintext.
+- **Command-Line Configuration:** All configuration is done via command-line arguments, making it easy to run in containerized environments.
 - **Robust Parsing:** Compatible with both RouterOS v6 and v7 ping output formats.
 - **Blackbox Style:** Designed to be scraped by Prometheus with a configuration that passes the target as a parameter.
 
@@ -20,39 +20,16 @@ This is a high-performance, concurrent Prometheus exporter for running ping test
 
 2.  **Install dependencies:**
     ```bash
-    pip install paramiko prometheus-client pyyaml cryptography
-    ```
-
-## Configuration
-
-1.  **Generate an encryption key:**
-    The first time you run the encryption script, it will generate a `secret.key` file. This file is essential for encrypting and decrypting your password. **Do not lose this file.**
-    ```bash
-    python3 encrypt_pass.py
-    ```
-
-2.  **Encrypt your password:**
-    Run the `encrypt_pass.py` script again and enter your MikroTik's SSH password when prompted. The script will output an encrypted password string.
-    ```bash
-    python3 encrypt_pass.py
-    ```
-
-3.  **Create `config.yml`:**
-    Create a file named `config.yml` and add your MikroTik's connection details. Use the encrypted password you generated in the previous step.
-    ```yaml
-    mikrotik:
-      host: 192.168.88.1  # Your MikroTik's IP address
-      user: your-ssh-user
-      password: 'your-encrypted-password'
+    pip install -r requirements.txt
     ```
 
 ## Usage
 
-To run the exporter:
+To run the exporter, you must provide the MikroTik's host, user, and password as command-line arguments:
 ```bash
-python3 main.py
+python3 main.py --host <your-mikrotik-ip> --user <your-ssh-user> --password <your-ssh-password>
 ```
-The exporter will start on port `9642`.
+The exporter will start on port `9642` by default. You can change this with the `--port` argument.
 
 ## Prometheus Configuration
 
