@@ -112,18 +112,20 @@ class MikroTikPingProber:
         return self._parse_ping_output(output, duration)
 
     def _parse_ping_output(self, output, duration):
-        match = re.search(r'seq=\d+ from=[\d.]+ ttl=(\d+) time=(\d+\.\d+)ms size=(\d+)', output)
+        rtt_match = re.search(r'time=(\d+\.?\d*)ms', output)
+        ttl_match = re.search(r'ttl=(\d+)', output)
+        size_match = re.search(r'size=(\d+)', output)
 
-        if match:
-            rtt_sec = float(match.group(2)) / 1000.0
-            ttl = int(match.group(1))
-            size = int(match.group(3))
-            up = 1
-        else:
+        if "timeout" in output or "no route to host" in output or not rtt_match:
+            up = 0
             rtt_sec = 0
             ttl = 0
             size = 0
-            up = 0
+        else:
+            up = 1
+            rtt_sec = float(rtt_match.group(1)) / 1000.0
+            ttl = int(ttl_match.group(1)) if ttl_match else 0
+            size = int(size_match.group(1)) if size_match else 56
 
         return {
             'rtt_sec': rtt_sec, 'up': up, 'ttl': ttl, 'size': size,
