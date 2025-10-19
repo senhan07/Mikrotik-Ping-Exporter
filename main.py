@@ -3,7 +3,7 @@ import paramiko
 import time
 import re
 import socket
-from prometheus_client import Gauge, Summary, Info, generate_latest, CollectorRegistry
+from prometheus_client import Gauge, Info, generate_latest, CollectorRegistry
 import yaml
 import threading
 import queue
@@ -72,12 +72,9 @@ class MikroTikSSHConnectionPool:
 
 # --- Global Metrics Registry ---
 GLOBAL_REGISTRY = CollectorRegistry()
-PING_RTT = Summary('mikrotik_ping_rtt_seconds', 'RTT summary (min, max, avg)', ['target', 'job'], registry=GLOBAL_REGISTRY)
-PING_LOSS = Gauge('mikrotik_ping_loss_percent', 'Packet loss %', ['target', 'job'], registry=GLOBAL_REGISTRY)
+PING_RTT = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', ['target', 'job'], registry=GLOBAL_REGISTRY)
 PING_UP = Gauge('mikrotik_ping_up', 'Target is reachable', ['target', 'job'], registry=GLOBAL_REGISTRY)
-PING_SENT = Gauge('mikrotik_ping_sent_packets', 'Packets sent', ['target', 'job'], registry=GLOBAL_REGISTRY)
-PING_RECV = Gauge('mikrotik_ping_received_packets', 'Packets received', ['target', 'job'], registry=GLOBAL_REGISTRY)
-PING_TTL = Gauge('mikrotik_ping_ttl', 'TTL from first packet', ['target', 'job'], registry=GLOBAL_REGISTRY)
+PING_TTL = Gauge('mikrotik_ping_ttl', 'Time-to-live', ['target', 'job'], registry=GLOBAL_REGISTRY)
 PING_SIZE = Gauge('mikrotik_ping_size_bytes', 'Packet size', ['target', 'job'], registry=GLOBAL_REGISTRY)
 PROBE_DURATION = Gauge('mikrotik_probe_duration_seconds', 'Probe duration', registry=GLOBAL_REGISTRY)
 TARGET_IP = Info('mikrotik_target_ip_address', 'Resolved IP address of target', ['target', 'job'], registry=GLOBAL_REGISTRY)
@@ -94,9 +91,9 @@ class MikroTikPingProber:
             print(f"Could not resolve {target}, using target as-is.")
             return target
 
-    def ping_target(self, target_ip, count=5):
+    def ping_target(self, target_ip):
         start_time = time.time()
-        cmd = f'/ping {target_ip} count={count}'
+        cmd = f'/ping {target_ip} count=1'
 
         output = ""
         error = ""
@@ -109,34 +106,32 @@ class MikroTikPingProber:
                     print(f"Error from MikroTik for target {target_ip}: {error}")
         except ConnectionError as e:
             print(f"SSH connection error for target {target_ip}: {e}")
-            return self._error_result(duration=time.time() - start_time, sent=count)
+            return self._error_result(duration=time.time() - start_time)
 
         duration = time.time() - start_time
-        return self._parse_ping_output(output, duration, count)
+        return self._parse_ping_output(output, duration)
 
-    def _parse_ping_output(self, output, duration, sent_count):
-        seq_matches = re.findall(r'^\s*seq=\d+ from=[\d.]+ ttl=(\d+) time=(\d+\.\d+)ms size=(\d+)', output, re.MULTILINE)
+    def _parse_ping_output(self, output, duration):
+        match = re.search(r'seq=\d+ from=[\d.]+ ttl=(\d+) time=(\d+\.\d+)ms size=(\d+)', output)
 
-        rtts_sec = [float(rtt) / 1000.0 for ttl, rtt, size in seq_matches]
-        ttl = int(seq_matches[0][0]) if seq_matches else 0
-        size = int(seq_matches[0][2]) if seq_matches else 56
-
-        sent_match = re.search(r'sent=(\d+)', output)
-        recv_match = re.search(r'received=(\d+)', output)
-        loss_match = re.search(r'packet-loss=(\d+)%', output)
-
-        sent = int(sent_match.group(1)) if sent_match else sent_count
-        recv = int(recv_match.group(1)) if recv_match else len(rtts_sec)
-        loss = float(loss_match.group(1)) if loss_match else (100.0 if sent == 0 else (sent - recv) * 100.0 / sent)
+        if match:
+            rtt_sec = float(match.group(2)) / 1000.0
+            ttl = int(match.group(1))
+            size = int(match.group(3))
+            up = 1
+        else:
+            rtt_sec = 0
+            ttl = 0
+            size = 0
+            up = 0
 
         return {
-            'rtts_sec': rtts_sec, 'loss': loss, 'up': 1 if recv > 0 else 0,
-            'sent': sent, 'recv': recv, 'ttl': ttl, 'size': size,
+            'rtt_sec': rtt_sec, 'up': up, 'ttl': ttl, 'size': size,
             'duration': duration
         }
 
-    def _error_result(self, duration, sent):
-        return { 'rtts_sec': [], 'loss': 100.0, 'up': 0, 'sent': sent, 'recv': 0, 'duration': duration}
+    def _error_result(self, duration):
+        return { 'rtt_sec': 0, 'up': 0, 'ttl': 0, 'size': 0, 'duration': duration}
 
 # --- HTTP Handler ---
 class ProbeHandler(BaseHTTPRequestHandler):
@@ -162,43 +157,33 @@ class ProbeHandler(BaseHTTPRequestHandler):
             self.send_error(400, 'Missing "target" parameter')
             return
 
-        count = int(query.get('count', ['10'])[0])
         job = query.get('job', ['mikrotik-exporter'])[0]
 
         resolved_ip = self.prober.resolve_target_ip(target)
-        result = self.prober.ping_target(resolved_ip, count)
+        result = self.prober.ping_target(resolved_ip)
 
         # Create a temporary registry for this request
         probe_registry = CollectorRegistry()
 
         # Define metrics for the temporary registry
-        ping_rtt_probe = Summary('mikrotik_ping_rtt_seconds', 'RTT summary', ['target', 'job'], registry=probe_registry)
-        ping_loss_probe = Gauge('mikrotik_ping_loss_percent', 'Packet loss %', ['target', 'job'], registry=probe_registry)
+        ping_rtt_probe = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', ['target', 'job'], registry=probe_registry)
         ping_up_probe = Gauge('mikrotik_ping_up', 'Target is reachable', ['target', 'job'], registry=probe_registry)
-        ping_sent_probe = Gauge('mikrotik_ping_sent_packets', 'Packets sent', ['target', 'job'], registry=probe_registry)
-        ping_recv_probe = Gauge('mikrotik_ping_received_packets', 'Packets received', ['target', 'job'], registry=probe_registry)
-        ping_ttl_probe = Gauge('mikrotik_ping_ttl', 'TTL from first packet', ['target', 'job'], registry=probe_registry)
+        ping_ttl_probe = Gauge('mikrotik_ping_ttl', 'Time-to-live', ['target', 'job'], registry=probe_registry)
         ping_size_probe = Gauge('mikrotik_ping_size_bytes', 'Packet size', ['target', 'job'], registry=probe_registry)
         probe_duration_probe = Gauge('mikrotik_probe_duration_seconds', 'Probe duration', registry=probe_registry)
+        target_ip_probe = Info('mikrotik_target_ip_address', 'Resolved IP address of target', ['target', 'job'], registry=probe_registry)
 
         # Populate temporary metrics
-        for rtt in result['rtts_sec']:
-            ping_rtt_probe.labels(target=target, job=job).observe(rtt)
-        ping_loss_probe.labels(target=target, job=job).set(result['loss'])
+        ping_rtt_probe.labels(target=target, job=job).set(result['rtt_sec'])
         ping_up_probe.labels(target=target, job=job).set(result['up'])
-        ping_sent_probe.labels(target=target, job=job).set(result['sent'])
-        ping_recv_probe.labels(target=target, job=job).set(result['recv'])
         ping_ttl_probe.labels(target=target, job=job).set(result['ttl'])
         ping_size_probe.labels(target=target, job=job).set(result['size'])
         probe_duration_probe.set(result['duration'])
+        target_ip_probe.labels(target=target, job=job).info({'ip': resolved_ip})
 
         # Update global metrics for /metrics endpoint
-        for rtt in result['rtts_sec']:
-            PING_RTT.labels(target=target, job=job).observe(rtt)
-        PING_LOSS.labels(target=target, job=job).set(result['loss'])
+        PING_RTT.labels(target=target, job=job).set(result['rtt_sec'])
         PING_UP.labels(target=target, job=job).set(result['up'])
-        PING_SENT.labels(target=target, job=job).set(result['sent'])
-        PING_RECV.labels(target=target, job=job).set(result['recv'])
         PING_TTL.labels(target=target, job=job).set(result['ttl'])
         PING_SIZE.labels(target=target, job=job).set(result['size'])
         PROBE_DURATION.set(result['duration'])
@@ -211,8 +196,8 @@ class ProbeHandler(BaseHTTPRequestHandler):
 
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         status = '🟢' if result['up'] else '🔴'
-        avg_rtt_ms = (sum(result['rtts_sec']) / len(result['rtts_sec']) * 1000) if result['rtts_sec'] else 0
-        print(f"[{timestamp}] {status} {target:<15} -> {resolved_ip:<15} | pkts:{result['sent']}/{result['recv']} | loss:{result['loss']:5.1f}% | avg_rtt:{avg_rtt_ms:.2f}ms | dur:{result['duration']:.2f}s")
+        rtt_ms = result['rtt_sec'] * 1000
+        print(f"[{timestamp}] {status} {target:<15} -> {resolved_ip:<15} | rtt:{rtt_ms:.2f}ms | ttl:{result['ttl']} | size:{result['size']} | dur:{result['duration']:.2f}s")
 
     def handle_metrics(self):
         self.send_response(200)

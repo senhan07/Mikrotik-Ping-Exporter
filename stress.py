@@ -63,13 +63,12 @@ async def probe_once(session: aiohttp.ClientSession, base_url: str, target: str,
 
 # ---------------- Main orchestrator ----------------
 async def run_stress_test(base_url: str, targets: List[str],
-                          count: int,
                           concurrency: int, timeout: int,
                           retries: int) -> None:
     connector = aiohttp.TCPConnector(limit_per_host=concurrency, limit=0)
     timeout_obj = aiohttp.ClientTimeout(total=None)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj) as session:
-        params = {"count": str(count)}
+        params = {}
         print(f"Launching {len(targets)} concurrent probe requests...")
         start_all = time.monotonic()
         tasks = [probe_once(session, base_url, t, params, timeout, retries) for t in targets]
@@ -108,7 +107,6 @@ def parse_args():
                    help="Path to a file containing targets (one per line).")
     p.add_argument("--concurrency", "-c", type=int, default=50,
                    help="Concurrent request count (default 50).")
-    p.add_argument("--count", type=int, default=5)
     p.add_argument("--timeout", type=int, default=10)
     p.add_argument("--retries", type=int, default=1)
     return p.parse_args()
@@ -135,7 +133,6 @@ def main():
 
     try:
         asyncio.run(run_stress_test(args.url, targets,
-                                    count=args.count,
                                     concurrency=args.concurrency,
                                     timeout=args.timeout, retries=args.retries))
     except KeyboardInterrupt:
