@@ -10,6 +10,7 @@ import queue
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from contextlib import contextmanager
+from functools import lru_cache
 
 # Load config
 with open('config.yml', 'r') as f:
@@ -84,6 +85,7 @@ class MikroTikPingProber:
     def __init__(self, pool):
         self.pool = pool
 
+    @lru_cache(maxsize=1024)
     def resolve_target_ip(self, target):
         try:
             return socket.gethostbyname(target)
@@ -112,20 +114,18 @@ class MikroTikPingProber:
         return self._parse_ping_output(output, duration)
 
     def _parse_ping_output(self, output, duration):
-        rtt_match = re.search(r'time=(\d+\.?\d*)ms', output)
-        ttl_match = re.search(r'ttl=(\d+)', output)
-        size_match = re.search(r'size=(\d+)', output)
+        match = re.search(r'^\s*\d+\s+[\d.]+\s+(\d+)\s+(\d+)\s+(\d+)ms', output, re.MULTILINE)
 
-        if "timeout" in output or "no route to host" in output or not rtt_match:
+        if match:
+            size = int(match.group(1))
+            ttl = int(match.group(2))
+            rtt_sec = float(match.group(3)) / 1000.0
+            up = 1
+        else:
             up = 0
             rtt_sec = 0
             ttl = 0
             size = 0
-        else:
-            up = 1
-            rtt_sec = float(rtt_match.group(1)) / 1000.0
-            ttl = int(ttl_match.group(1)) if ttl_match else 0
-            size = int(size_match.group(1)) if size_match else 56
 
         return {
             'rtt_sec': rtt_sec, 'up': up, 'ttl': ttl, 'size': size,
