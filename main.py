@@ -3,14 +3,13 @@ import paramiko
 import time
 import re
 import socket
-from prometheus_client import Gauge, Info, generate_latest, CollectorRegistry
+from prometheus_client import Gauge, Info, generate_latest, CollectorRegistry, Metric
 import yaml
 import threading
 import queue
 from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from contextlib import contextmanager
-from functools import lru_cache
 
 # Load config
 with open('config.yml', 'r') as f:
@@ -71,21 +70,56 @@ class MikroTikSSHConnectionPool:
         finally:
             self._pool.put(conn)
 
+# --- Custom Collector for Dynamic Labels ---
+class MikroTikCollector:
+    def __init__(self):
+        self.probes = {}
+        self._lock = threading.Lock()
+
+    def add_probe_result(self, labels, result):
+        with self._lock:
+            # Use a frozenset of items as the key to handle dict ordering
+            self.probes[frozenset(labels.items())] = result
+
+    def collect(self):
+        with self._lock:
+            for labels, result in self.probes.items():
+                label_dict = dict(labels)
+
+                # RTT
+                rtt_metric = Metric('mikrotik_ping_rtt_seconds', 'Round-trip time', 'gauge')
+                rtt_metric.add_sample('mikrotik_ping_rtt_seconds', value=result['rtt_sec'], labels=label_dict)
+                yield rtt_metric
+
+                # Up
+                up_metric = Metric('mikrotik_ping_up', 'Target is reachable', 'gauge')
+                up_metric.add_sample('mikrotik_ping_up', value=result['up'], labels=label_dict)
+                yield up_metric
+
+                # TTL
+                ttl_metric = Metric('mikrotik_ping_ttl', 'Time-to-live', 'gauge')
+                ttl_metric.add_sample('mikrotik_ping_ttl', value=result['ttl'], labels=label_dict)
+                yield ttl_metric
+
+                # Size
+                size_metric = Metric('mikrotik_ping_size_bytes', 'Packet size', 'gauge')
+                size_metric.add_sample('mikrotik_ping_size_bytes', value=result['size'], labels=label_dict)
+                yield size_metric
+
+                # Target IP Info
+                info_metric = Metric('mikrotik_target_ip_address', 'Resolved IP address of target', 'info')
+                info_metric.add_sample('mikrotik_target_ip_address_info', value={'ip': result['resolved_ip']}, labels=label_dict)
+                yield info_metric
+
 # --- Global Metrics Registry ---
 GLOBAL_REGISTRY = CollectorRegistry()
-PING_RTT = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', ['target', 'job'], registry=GLOBAL_REGISTRY)
-PING_UP = Gauge('mikrotik_ping_up', 'Target is reachable', ['target', 'job'], registry=GLOBAL_REGISTRY)
-PING_TTL = Gauge('mikrotik_ping_ttl', 'Time-to-live', ['target', 'job'], registry=GLOBAL_REGISTRY)
-PING_SIZE = Gauge('mikrotik_ping_size_bytes', 'Packet size', ['target', 'job'], registry=GLOBAL_REGISTRY)
 PROBE_DURATION = Gauge('mikrotik_probe_duration_seconds', 'Probe duration', registry=GLOBAL_REGISTRY)
-TARGET_IP = Info('mikrotik_target_ip_address', 'Resolved IP address of target', ['target', 'job'], registry=GLOBAL_REGISTRY)
 
 # --- Prober ---
 class MikroTikPingProber:
     def __init__(self, pool):
         self.pool = pool
 
-    @lru_cache(maxsize=1024)
     def resolve_target_ip(self, target):
         try:
             return socket.gethostbyname(target)
@@ -116,7 +150,7 @@ class MikroTikPingProber:
     def _parse_ping_output(self, output, duration):
         match = re.search(r'^\s*\d+\s+[\d.]+\s+(\d+)\s+(\d+)\s+(\d+)ms', output, re.MULTILINE)
 
-        if match:
+        if match and "ttl-exceeded" not in output:
             size = int(match.group(1))
             ttl = int(match.group(2))
             rtt_sec = float(match.group(3)) / 1000.0
@@ -126,6 +160,9 @@ class MikroTikPingProber:
             rtt_sec = 0
             ttl = 0
             size = 0
+
+        if "timeout" in output or "no route to host" in output:
+            up = 0
 
         return {
             'rtt_sec': rtt_sec, 'up': up, 'ttl': ttl, 'size': size,
@@ -137,8 +174,9 @@ class MikroTikPingProber:
 
 # --- HTTP Handler ---
 class ProbeHandler(BaseHTTPRequestHandler):
-    def __init__(self, prober, *args, **kwargs):
+    def __init__(self, prober, collector, *args, **kwargs):
         self.prober = prober
+        self.collector = collector
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
@@ -159,37 +197,37 @@ class ProbeHandler(BaseHTTPRequestHandler):
             self.send_error(400, 'Missing "target" parameter')
             return
 
-        job = query.get('job', ['mikrotik-exporter'])[0]
+        # Extract dynamic labels from query parameters
+        dynamic_labels = {k: v[0] for k, v in query.items() if k not in ['target']}
 
         resolved_ip = self.prober.resolve_target_ip(target)
         result = self.prober.ping_target(resolved_ip)
+        result['resolved_ip'] = resolved_ip
+
+        # Create labels for the collector
+        labels = {'target': target, **dynamic_labels}
+        self.collector.add_probe_result(labels, result)
 
         # Create a temporary registry for this request
         probe_registry = CollectorRegistry()
 
         # Define metrics for the temporary registry
-        ping_rtt_probe = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', ['target', 'job'], registry=probe_registry)
-        ping_up_probe = Gauge('mikrotik_ping_up', 'Target is reachable', ['target', 'job'], registry=probe_registry)
-        ping_ttl_probe = Gauge('mikrotik_ping_ttl', 'Time-to-live', ['target', 'job'], registry=probe_registry)
-        ping_size_probe = Gauge('mikrotik_ping_size_bytes', 'Packet size', ['target', 'job'], registry=probe_registry)
+        ping_rtt_probe = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', registry=probe_registry)
+        ping_up_probe = Gauge('mikrotik_ping_up', 'Target is reachable', registry=probe_registry)
+        ping_ttl_probe = Gauge('mikrotik_ping_ttl', 'Time-to-live', registry=probe_registry)
+        ping_size_probe = Gauge('mikrotik_ping_size_bytes', 'Packet size', registry=probe_registry)
         probe_duration_probe = Gauge('mikrotik_probe_duration_seconds', 'Probe duration', registry=probe_registry)
-        target_ip_probe = Info('mikrotik_target_ip_address', 'Resolved IP address of target', ['target', 'job'], registry=probe_registry)
+        target_ip_probe = Info('mikrotik_target_ip_address', 'Resolved IP address of target', registry=probe_registry)
 
         # Populate temporary metrics
-        ping_rtt_probe.labels(target=target, job=job).set(result['rtt_sec'])
-        ping_up_probe.labels(target=target, job=job).set(result['up'])
-        ping_ttl_probe.labels(target=target, job=job).set(result['ttl'])
-        ping_size_probe.labels(target=target, job=job).set(result['size'])
+        ping_rtt_probe.set(result['rtt_sec'])
+        ping_up_probe.set(result['up'])
+        ping_ttl_probe.set(result['ttl'])
+        ping_size_probe.set(result['size'])
         probe_duration_probe.set(result['duration'])
-        target_ip_probe.labels(target=target, job=job).info({'ip': resolved_ip})
+        target_ip_probe.info({'ip': resolved_ip})
 
-        # Update global metrics for /metrics endpoint
-        PING_RTT.labels(target=target, job=job).set(result['rtt_sec'])
-        PING_UP.labels(target=target, job=job).set(result['up'])
-        PING_TTL.labels(target=target, job=job).set(result['ttl'])
-        PING_SIZE.labels(target=target, job=job).set(result['size'])
         PROBE_DURATION.set(result['duration'])
-        TARGET_IP.labels(target=target, job=job).info({'ip': resolved_ip})
 
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain; version=0.0.4')
@@ -211,9 +249,9 @@ class ProbeHandler(BaseHTTPRequestHandler):
         # Suppress routine server logging
         pass
 
-def run_server(prober, port=9642):
+def run_server(prober, collector, port=9642):
     server_address = ('0.0.0.0', port)
-    httpd = ThreadingHTTPServer(server_address, lambda *args, **kwargs: ProbeHandler(prober, *args, **kwargs))
+    httpd = ThreadingHTTPServer(server_address, lambda *args, **kwargs: ProbeHandler(prober, collector, *args, **kwargs))
     print(f"🚀 MikroTik High-Concurrency Ping Exporter on port {port}")
     print(f"📖 Usage: http://127.0.0.1:{port}/probe?target=google.com")
     print(f"📖 Metrics: http://127.0.0.1:{port}/metrics")
@@ -222,9 +260,11 @@ def run_server(prober, port=9642):
 if __name__ == '__main__':
     try:
         print("🚀 Starting MikroTik Ping Exporter...")
+        collector = MikroTikCollector()
+        GLOBAL_REGISTRY.register(collector)
         ssh_pool = MikroTikSSHConnectionPool(max_connections=MAX_SSH_CONNECTIONS)
         prober = MikroTikPingProber(ssh_pool)
-        run_server(prober, 9642)
+        run_server(prober, collector, 9642)
     except Exception as e:
         import traceback
         with open("error.log", "w") as f:
