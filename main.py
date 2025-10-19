@@ -3,7 +3,7 @@ import paramiko
 import time
 import re
 import socket
-from prometheus_client import Gauge, Histogram, Info, generate_latest, CollectorRegistry
+from prometheus_client import Gauge, Summary, Info, generate_latest, CollectorRegistry
 import yaml
 import threading
 import queue
@@ -72,7 +72,7 @@ class MikroTikSSHConnectionPool:
 
 # --- Global Metrics Registry ---
 GLOBAL_REGISTRY = CollectorRegistry()
-PING_RTT = Histogram('mikrotik_ping_rtt_seconds', 'RTT distribution buckets (burst pings)', ['target', 'job'], registry=GLOBAL_REGISTRY, buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, float('inf')])
+PING_RTT = Summary('mikrotik_ping_rtt_seconds', 'RTT summary (min, max, avg)', ['target', 'job'], registry=GLOBAL_REGISTRY)
 PING_LOSS = Gauge('mikrotik_ping_loss_percent', 'Packet loss %', ['target', 'job'], registry=GLOBAL_REGISTRY)
 PING_UP = Gauge('mikrotik_ping_up', 'Target is reachable', ['target', 'job'], registry=GLOBAL_REGISTRY)
 PING_SENT = Gauge('mikrotik_ping_sent_packets', 'Packets sent', ['target', 'job'], registry=GLOBAL_REGISTRY)
@@ -94,10 +94,9 @@ class MikroTikPingProber:
             print(f"Could not resolve {target}, using target as-is.")
             return target
 
-    def ping_burst_target(self, target_ip, count=5, burst=10):
+    def ping_target(self, target_ip, count=5):
         start_time = time.time()
-        interval_ms = max(10, 1000 // burst)
-        cmd = f'/ping {target_ip} count={count} interval={interval_ms}ms'
+        cmd = f'/ping {target_ip} count={count}'
 
         output = ""
         error = ""
@@ -113,9 +112,9 @@ class MikroTikPingProber:
             return self._error_result(duration=time.time() - start_time, sent=count)
 
         duration = time.time() - start_time
-        return self._parse_ping_output(output, duration, burst, count)
+        return self._parse_ping_output(output, duration, count)
 
-    def _parse_ping_output(self, output, duration, burst, sent_count):
+    def _parse_ping_output(self, output, duration, sent_count):
         seq_matches = re.findall(r'^\s*seq=\d+ from=[\d.]+ ttl=(\d+) time=(\d+\.\d+)ms size=(\d+)', output, re.MULTILINE)
 
         rtts_sec = [float(rtt) / 1000.0 for ttl, rtt, size in seq_matches]
@@ -133,11 +132,11 @@ class MikroTikPingProber:
         return {
             'rtts_sec': rtts_sec, 'loss': loss, 'up': 1 if recv > 0 else 0,
             'sent': sent, 'recv': recv, 'ttl': ttl, 'size': size,
-            'duration': duration, 'burst_pps': burst
+            'duration': duration
         }
 
     def _error_result(self, duration, sent):
-        return { 'rtts_sec': [], 'loss': 100.0, 'up': 0, 'sent': sent, 'recv': 0, 'duration': duration, 'burst_pps': 0}
+        return { 'rtts_sec': [], 'loss': 100.0, 'up': 0, 'sent': sent, 'recv': 0, 'duration': duration}
 
 # --- HTTP Handler ---
 class ProbeHandler(BaseHTTPRequestHandler):
@@ -164,17 +163,16 @@ class ProbeHandler(BaseHTTPRequestHandler):
             return
 
         count = int(query.get('count', ['10'])[0])
-        burst = int(query.get('burst', ['10'])[0])
         job = query.get('job', ['mikrotik-exporter'])[0]
 
         resolved_ip = self.prober.resolve_target_ip(target)
-        result = self.prober.ping_burst_target(resolved_ip, count, burst)
+        result = self.prober.ping_target(resolved_ip, count)
 
         # Create a temporary registry for this request
         probe_registry = CollectorRegistry()
 
         # Define metrics for the temporary registry
-        ping_rtt_probe = Histogram('mikrotik_ping_rtt_seconds', 'RTT distribution buckets', ['target', 'job'], registry=probe_registry, buckets=PING_RTT._buckets)
+        ping_rtt_probe = Summary('mikrotik_ping_rtt_seconds', 'RTT summary', ['target', 'job'], registry=probe_registry)
         ping_loss_probe = Gauge('mikrotik_ping_loss_percent', 'Packet loss %', ['target', 'job'], registry=probe_registry)
         ping_up_probe = Gauge('mikrotik_ping_up', 'Target is reachable', ['target', 'job'], registry=probe_registry)
         ping_sent_probe = Gauge('mikrotik_ping_sent_packets', 'Packets sent', ['target', 'job'], registry=probe_registry)
