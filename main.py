@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-import paramiko
 import time
 import re
 import socket
-from prometheus_client import Gauge, Info, generate_latest, CollectorRegistry, Metric
+from prometheus_client import Gauge, Info, generate_latest, CollectorRegistry
 import argparse
 import threading
 import queue
@@ -12,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from contextlib import contextmanager
 
 # --- SSH Connection Pooling ---
+import paramiko
+
 class MikroTikSSHConnection:
     def __init__(self, host, alt_host, user, password, port):
         self.host = host
@@ -20,7 +21,6 @@ class MikroTikSSHConnection:
         self.password = password
         self.port = port
         self.ssh = None
-        self.connect()
 
     def connect(self):
         try:
@@ -60,15 +60,17 @@ class MikroTikSSHConnectionPool:
         self.ssh_port = ssh_port
         self.max_connections = max_connections
         self._pool = queue.Queue(maxsize=max_connections)
-        for _ in range(max_connections):
-            self._pool.put(self._create_connection())
 
     def _create_connection(self):
         return MikroTikSSHConnection(self.host, self.alt_host, self.user, self.password, self.ssh_port)
 
     @contextmanager
     def connection(self):
-        conn = self._pool.get()
+        try:
+            conn = self._pool.get_nowait()
+        except queue.Empty:
+            conn = self._create_connection()
+
         try:
             if not conn.is_active():
                 print("SSH connection was inactive, creating a new one.")
@@ -77,48 +79,8 @@ class MikroTikSSHConnectionPool:
         finally:
             self._pool.put(conn)
 
-# --- Custom Collector for Dynamic Labels ---
-class MikroTikCollector:
-    def __init__(self):
-        self.probes = {}
-        self._lock = threading.Lock()
-
-    def add_probe_result(self, labels, result):
-        with self._lock:
-            # Use a frozenset of items as the key to handle dict ordering
-            self.probes[frozenset(labels.items())] = result
-
-    def collect(self):
-        with self._lock:
-            for labels, result in self.probes.items():
-                label_dict = dict(labels)
-
-                # RTT
-                rtt_metric = Metric('mikrotik_ping_rtt_seconds', 'Round-trip time', 'gauge')
-                rtt_metric.add_sample('mikrotik_ping_rtt_seconds', value=result['rtt_sec'], labels=label_dict)
-                yield rtt_metric
-
-                # Up
-                up_metric = Metric('mikrotik_ping_up', 'Target is reachable', 'gauge')
-                up_metric.add_sample('mikrotik_ping_up', value=result['up'], labels=label_dict)
-                yield up_metric
-
-                # TTL
-                ttl_metric = Metric('mikrotik_ping_ttl', 'Time-to-live', 'gauge')
-                ttl_metric.add_sample('mikrotik_ping_ttl', value=result['ttl'], labels=label_dict)
-                yield ttl_metric
-
-                # Size
-                size_metric = Metric('mikrotik_ping_size_bytes', 'Packet size', 'gauge')
-                size_metric.add_sample('mikrotik_ping_size_bytes', value=result['size'], labels=label_dict)
-                yield size_metric
-
-                # Target IP Info
-                info_metric = Metric('mikrotik_target_ip_address', 'Resolved IP address of target', 'info')
-                info_metric.add_sample('mikrotik_target_ip_address_info', value={'ip': result['resolved_ip']}, labels=label_dict)
-                yield info_metric
-
 # --- Global Metrics Registry ---
+# This registry is only for metrics that are not dynamically labeled, like probe duration.
 GLOBAL_REGISTRY = CollectorRegistry()
 PROBE_DURATION = Gauge('mikrotik_probe_duration_seconds', 'Probe duration', registry=GLOBAL_REGISTRY)
 
@@ -191,9 +153,8 @@ class MikroTikPingProber:
 
 # --- HTTP Handler ---
 class ProbeHandler(BaseHTTPRequestHandler):
-    def __init__(self, prober, collector, *args, **kwargs):
+    def __init__(self, prober, *args, **kwargs):
         self.prober = prober
-        self.collector = collector
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
@@ -219,17 +180,11 @@ class ProbeHandler(BaseHTTPRequestHandler):
 
         resolved_ip = self.prober.resolve_target_ip(target)
         result = self.prober.ping_target(resolved_ip)
-        result['resolved_ip'] = resolved_ip
-
-        # Create labels for the collector
-        labels = {'target': target, **dynamic_labels}
-        self.collector.add_probe_result(labels, result)
 
         # Create a temporary registry for this request
         probe_registry = CollectorRegistry()
 
         label_keys = ['target'] + list(dynamic_labels.keys())
-        label_values = [target] + list(dynamic_labels.values())
 
         # Define metrics for the temporary registry
         ping_rtt_probe = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', label_keys, registry=probe_registry)
@@ -240,12 +195,13 @@ class ProbeHandler(BaseHTTPRequestHandler):
         target_ip_probe = Info('mikrotik_target_ip_address', 'Resolved IP address of target', label_keys, registry=probe_registry)
 
         # Populate temporary metrics
-        ping_rtt_probe.labels(*label_values).set(result['rtt_sec'])
-        ping_up_probe.labels(*label_values).set(result['up'])
-        ping_ttl_probe.labels(*label_values).set(result['ttl'])
-        ping_size_probe.labels(*label_values).set(result['size'])
+        labels = {'target': target, **dynamic_labels}
+        ping_rtt_probe.labels(**labels).set(result['rtt_sec'])
+        ping_up_probe.labels(**labels).set(result['up'])
+        ping_ttl_probe.labels(**labels).set(result['ttl'])
+        ping_size_probe.labels(**labels).set(result['size'])
         probe_duration_probe.set(result['duration'])
-        target_ip_probe.labels(*label_values).info({'ip': resolved_ip})
+        target_ip_probe.labels(**labels).info({'ip': resolved_ip})
 
         PROBE_DURATION.set(result['duration'])
 
@@ -273,9 +229,9 @@ class ProbeHandler(BaseHTTPRequestHandler):
         # Suppress routine server logging
         pass
 
-def run_server(prober, collector, port=9642):
+def run_server(prober, port=9642):
     server_address = ('0.0.0.0', port)
-    httpd = ThreadingHTTPServer(server_address, lambda *args, **kwargs: ProbeHandler(prober, collector, *args, **kwargs))
+    httpd = ThreadingHTTPServer(server_address, lambda *args, **kwargs: ProbeHandler(prober, *args, **kwargs))
     print(f"🚀 MikroTik High-Concurrency Ping Exporter on port {port}")
     print(f"📖 Usage: http://127.0.0.1:{port}/probe?target=google.com")
     print(f"📖 Metrics: http://127.0.0.1:{port}/metrics")
@@ -284,22 +240,15 @@ def run_server(prober, collector, port=9642):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='MikroTik Ping Exporter')
     parser.add_argument('--host', required=True, help='MikroTik host (primary)')
-    parser.add_argument('--host.alt', help='Alternate MikroTik host (for failover)')
+    parser.add_argument('--host.alt', dest='host_alt', help='Alternate MikroTik host (for failover)')
     parser.add_argument('--user', required=True, help='MikroTik user')
-    parser.add_argument('--password', required=True, help='MikroTik password')
-    parser.add_argument('--port.probe', type=int, default=9642, help='Port for the exporter to listen on')
-    parser.add_argument('--port.ssh', type=int, default=22, help='SSH port for the MikroTik router')
+    parser.add_argument('--password', '--pass', dest='password', required=True, help='MikroTik password')
+    parser.add_argument('--port.probe', dest='port_probe', type=int, default=9642, help='Port for the exporter to listen on')
+    parser.add_argument('--port.ssh', dest='port_ssh', type=int, default=22, help='SSH port for the MikroTik router')
     parser.add_argument('--sessions', type=int, default=10, help='Number of concurrent SSH sessions')
     args = parser.parse_args()
 
-    try:
-        print("🚀 Starting MikroTik Ping Exporter...")
-        collector = MikroTikCollector()
-        GLOBAL_REGISTRY.register(collector)
-        ssh_pool = MikroTikSSHConnectionPool(args.host, args.host_alt, args.user, args.password, args.port_ssh, args.sessions)
-        prober = MikroTikPingProber(ssh_pool)
-        run_server(prober, collector, args.port_probe)
-    except Exception as e:
-        import traceback
-        with open("error.log", "w") as f:
-            f.write(traceback.format_exc())
+    print("🚀 Starting MikroTik Ping Exporter...")
+    ssh_pool = MikroTikSSHConnectionPool(args.host, args.host_alt, args.user, args.password, args.port_ssh, args.sessions)
+    prober = MikroTikPingProber(ssh_pool)
+    run_server(prober, args.port_probe)

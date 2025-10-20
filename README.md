@@ -33,14 +33,14 @@ To run the exporter, you must provide the MikroTik's host, user, and password as
 | `--host` | The primary IP address of the MikroTik router. | **Required** |
 | `--host.alt` | An alternate IP address for the MikroTik router for failover. | `None` |
 | `--user` | The SSH username for the MikroTik router. | **Required** |
-| `--password` | The SSH password for the MikroTik router. | **Required** |
+| `--password` or `--pass` | The SSH password for the MikroTik router. | **Required** |
 | `--port.probe`| The port for the exporter to listen on. | `9642` |
 | `--port.ssh` | The SSH port for the MikroTik router. | `22` |
 | `--sessions` | The number of concurrent SSH sessions in the connection pool. | `10` |
 
 **Example:**
 ```bash
-python3 main.py --host 192.168.88.1 --host.alt 192.168.89.1 --user myuser --password mypassword
+python3 main.py --host 192.168.88.1 --host.alt 192.168.89.1 --user myuser --pass mypassword
 ```
 
 ## Prometheus Configuration
