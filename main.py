@@ -2,6 +2,7 @@
 import time
 import re
 import socket
+import logging
 from prometheus_client import Gauge, Info, generate_latest, CollectorRegistry
 import argparse
 import threading
@@ -27,16 +28,16 @@ class MikroTikSSHConnection:
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             self.ssh.connect(self.host, username=self.user, password=self.password, port=self.port, timeout=10, look_for_keys=False)
-            print(f"SSH connection to {self.host} successful.")
+            logging.info(f"SSH connection to {self.host} successful.")
         except Exception as e:
-            print(f"Error connecting to primary host {self.host}: {e}")
+            logging.error(f"Error connecting to primary host {self.host}: {e}")
             if self.alt_host:
-                print(f"Trying alternate host {self.alt_host}...")
+                logging.info(f"Trying alternate host {self.alt_host}...")
                 try:
                     self.ssh.connect(self.alt_host, username=self.user, password=self.password, port=self.port, timeout=10, look_for_keys=False)
-                    print(f"SSH connection to {self.alt_host} successful.")
+                    logging.info(f"SSH connection to {self.alt_host} successful.")
                 except Exception as e2:
-                    print(f"Error connecting to alternate host {self.alt_host}: {e2}")
+                    logging.error(f"Error connecting to alternate host {self.alt_host}: {e2}")
                     self.ssh = None
             else:
                 self.ssh = None
@@ -72,7 +73,7 @@ class MikroTikSSHConnectionPool:
 
         try:
             if not conn.is_active():
-                print("SSH connection was inactive, creating a new one.")
+                logging.warning("SSH connection was inactive, creating a new one.")
                 conn = self._create_connection()
             yield conn
         finally:
@@ -92,7 +93,7 @@ class MikroTikPingProber:
         try:
             return socket.gethostbyname(target)
         except socket.gaierror:
-            print(f"Could not resolve {target}, using target as-is.")
+            logging.warning(f"Could not resolve {target}, using target as-is.")
             return target
 
     def ping_target(self, target_ip):
@@ -107,9 +108,9 @@ class MikroTikPingProber:
                 output = stdout.read().decode().strip()
                 error = stderr.read().decode().strip()
                 if error:
-                    print(f"Error from MikroTik for target {target_ip}: {error}")
+                    logging.error(f"Error from MikroTik for target {target_ip}: {error}")
         except ConnectionError as e:
-            print(f"SSH connection error for target {target_ip}: {e}")
+            logging.error(f"SSH connection error for target {target_ip}: {e}")
             return self._error_result(duration=time.time() - start_time)
 
         duration = time.time() - start_time
@@ -207,13 +208,17 @@ class ProbeHandler(BaseHTTPRequestHandler):
         try:
             self.wfile.write(generate_latest(probe_registry))
         except ConnectionAbortedError:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Client closed connection early for target {target}")
+            logging.warning(f"Client closed connection early for target {target}")
             return
 
-        timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         status = '🟢' if result['up'] else '🔴'
         rtt_ms = result['rtt_sec'] * 1000
-        print(f"[{timestamp}] {status} {target:<15} -> {resolved_ip:<15} | rtt:{rtt_ms:.2f}ms | ttl:{result['ttl']} | size:{result['size']} | dur:{result['duration']:.2f}s")
+        log_message = f"{status} {target:<15} -> {resolved_ip:<15} | rtt:{rtt_ms:.2f}ms | ttl:{result['ttl']} | size:{result['size']} | dur:{result['duration']:.2f}s"
+
+        if result['up']:
+            logging.info(log_message)
+        else:
+            logging.error(log_message)
 
     def handle_metrics(self):
         self.send_response(200)
@@ -228,9 +233,9 @@ class ProbeHandler(BaseHTTPRequestHandler):
 def run_server(prober, port=9642):
     server_address = ('0.0.0.0', port)
     httpd = ThreadingHTTPServer(server_address, lambda *args, **kwargs: ProbeHandler(prober, *args, **kwargs))
-    print(f"🚀 MikroTik High-Concurrency Ping Exporter on port {port}")
-    print(f"📖 Usage: http://127.0.0.1:{port}/probe?target=google.com")
-    print(f"📖 Metrics: http://127.0.0.1:{port}/metrics")
+    logging.info(f"🚀 MikroTik High-Concurrency Ping Exporter on port {port}")
+    logging.info(f"📖 Usage: http://127.0.0.1:{port}/probe?target=google.com")
+    logging.info(f"📖 Metrics: http://127.0.0.1:{port}/metrics")
     httpd.serve_forever()
 
 if __name__ == '__main__':
@@ -242,9 +247,14 @@ if __name__ == '__main__':
     parser.add_argument('--port.probe', dest='port_probe', type=int, default=9642, help='Port for the exporter to listen on')
     parser.add_argument('--port.ssh', dest='port_ssh', type=int, default=22, help='SSH port for the MikroTik router')
     parser.add_argument('--sessions', type=int, default=5, help='Number of concurrent SSH sessions')
+    parser.add_argument('--log-level', dest='log_level', choices=['DEBUG', 'INFO', 'ERROR'], default='INFO', help='Set the logging level')
     args = parser.parse_args()
 
-    print("🚀 Starting MikroTik Ping Exporter...")
+    logging.basicConfig(level=getattr(logging, args.log_level),
+                        format='%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S')
+
+    logging.info("🚀 Starting MikroTik Ping Exporter...")
     ssh_pool = MikroTikSSHConnectionPool(args.host, args.host_alt, args.user, args.password, args.port_ssh, args.sessions)
     prober = MikroTikPingProber(ssh_pool)
     run_server(prober, args.port_probe)
