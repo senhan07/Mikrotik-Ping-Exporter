@@ -216,7 +216,7 @@ if __name__ == '__main__':
     parser.add_argument('--port.ssh', dest='port_ssh', type=int, default=22, help='SSH port for the MikroTik router')
     parser.add_argument('--sessions', type=int, default=5, help='Number of concurrent SSH sessions')
     parser.add_argument('--targets', required=True, help='Path to targets.yml file')
-    parser.add_argument('--remote-write-url', required=True, help='Prometheus remote write URL')
+    parser.add_argument('--remote-write-url', '--remote-url', dest='remote_write_url', required=True, help='Prometheus remote write URL')
     parser.add_argument('--interval', type=int, default=5, help='Scrape interval in seconds')
     args = parser.parse_args()
 

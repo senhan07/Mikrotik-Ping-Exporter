@@ -1,7 +1,6 @@
 paramiko
-prometheus-client
+prometheus-client>=0.12.0
 cryptography
-aiohttp
 requests
 protobuf
 python-snappy

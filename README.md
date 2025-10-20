@@ -20,7 +20,7 @@ This is a high-performance, concurrent agent for running ping tests from a Mikro
 
 2.  **Install dependencies:**
     ```bash
-    pip install -r requirements.txt
+    pip install -r requirements.txt --upgrade
     ```
 
 ## Configuration
@@ -49,8 +49,10 @@ To run the agent, you must provide the MikroTik's host, user, and password, as w
 | `--port.ssh` | The SSH port for the MikroTik router. | `22` |
 | `--sessions` | The number of concurrent SSH sessions in the connection pool. | `5` |
 | `--targets` | The path to your `targets.yml` file. | **Required** |
-| `--remote-write-url` | The URL of your Prometheus remote write endpoint. | **Required** |
+| `--remote-write-url` or `--remote-url` | The URL of your Prometheus remote write endpoint. | **Required** |
 | `--interval` | The interval, in seconds, at which to run the probes. | `5` |
+
+**Note on `--sessions`:** The optimal value for this argument depends on your router's hardware and configuration. If you see "SSH connection error" or "timed out" messages, you may need to lower this value.
 
 **Example:**
 ```bash
@@ -59,7 +61,8 @@ python3 main.py \
   --user myuser \
   --pass mypassword \
   --targets targets.yml \
-  --remote-write-url http://localhost:9090/api/v1/write
+  --remote-url http://localhost:9090/api/v1/write \
+  --interval 10
 ```
 
 ## Metrics
