@@ -60,16 +60,15 @@ class MikroTikSSHConnectionPool:
         self.ssh_port = ssh_port
         self.max_connections = max_connections
         self._pool = queue.Queue(maxsize=max_connections)
+        for _ in range(max_connections):
+            self._pool.put(self._create_connection())
 
     def _create_connection(self):
         return MikroTikSSHConnection(self.host, self.alt_host, self.user, self.password, self.ssh_port)
 
     @contextmanager
     def connection(self):
-        try:
-            conn = self._pool.get_nowait()
-        except queue.Empty:
-            conn = self._create_connection()
+        conn = self._pool.get() # This will block until a connection is available
 
         try:
             if not conn.is_active():
@@ -245,7 +244,7 @@ if __name__ == '__main__':
     parser.add_argument('--password', '--pass', dest='password', required=True, help='MikroTik password')
     parser.add_argument('--port.probe', dest='port_probe', type=int, default=9642, help='Port for the exporter to listen on')
     parser.add_argument('--port.ssh', dest='port_ssh', type=int, default=22, help='SSH port for the MikroTik router')
-    parser.add_argument('--sessions', type=int, default=10, help='Number of concurrent SSH sessions')
+    parser.add_argument('--sessions', type=int, default=5, help='Number of concurrent SSH sessions')
     args = parser.parse_args()
 
     print("🚀 Starting MikroTik Ping Exporter...")
