@@ -116,6 +116,9 @@ class MikroTikPingProber:
         return self._parse_ping_output(output, duration)
 
     def _parse_ping_output(self, output, duration):
+        if "timeout" in output or "no route to host" in output or "host unreachable" in output or "ttl-exceeded" in output:
+            return self._error_result(duration)
+
         # RouterOS v6 Style
         match_v6 = re.search(r'^\s*\d+\s+[\d.]+\s+(\d+)\s+(\d+)\s+(\d+)ms', output, re.MULTILINE)
 
@@ -123,7 +126,7 @@ class MikroTikPingProber:
         rtt_match_v7 = re.search(r'time=(\d+\.?\d*)ms', output)
         ttl_match_v7 = re.search(r'ttl=(\d+)', output)
 
-        if match_v6 and "ttl-exceeded" not in output:
+        if match_v6:
             size = int(match_v6.group(1))
             ttl = int(match_v6.group(2))
             rtt_sec = float(match_v6.group(3)) / 1000.0
@@ -134,13 +137,7 @@ class MikroTikPingProber:
             size = 56  # Default size for v7 style
             up = 1
         else:
-            up = 0
-            rtt_sec = 0
-            ttl = 0
-            size = 0
-
-        if "timeout" in output or "no route to host" in output:
-            up = 0
+            return self._error_result(duration)
 
         return {
             'rtt_sec': rtt_sec, 'up': up, 'ttl': ttl, 'size': size,
