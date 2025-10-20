@@ -26,14 +26,14 @@ class MikroTikSSHConnection:
         try:
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh.connect(self.host, username=self.user, password=self.password, port=self.port, timeout=10)
+            self.ssh.connect(self.host, username=self.user, password=self.password, port=self.port, timeout=10, look_for_keys=False)
             print(f"SSH connection to {self.host} successful.")
         except Exception as e:
             print(f"Error connecting to primary host {self.host}: {e}")
             if self.alt_host:
                 print(f"Trying alternate host {self.alt_host}...")
                 try:
-                    self.ssh.connect(self.alt_host, username=self.user, password=self.password, port=self.port, timeout=10)
+                    self.ssh.connect(self.alt_host, username=self.user, password=self.password, port=self.port, timeout=10, look_for_keys=False)
                     print(f"SSH connection to {self.alt_host} successful.")
                 except Exception as e2:
                     print(f"Error connecting to alternate host {self.alt_host}: {e2}")
