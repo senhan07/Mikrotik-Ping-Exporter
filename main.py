@@ -3,180 +3,287 @@ import paramiko
 import time
 import re
 import socket
-from prometheus_client import Gauge, Histogram, Info, generate_latest
-import yaml
+from prometheus_client import Gauge, Info, generate_latest, CollectorRegistry, Metric
+import argparse
 import threading
+import queue
 from urllib.parse import parse_qs, urlparse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from contextlib import contextmanager
 
-# Load config
-with open('config.yml', 'r') as f:
-    config = yaml.safe_load(f)
-
-SSH_HOST = config['mikrotik']['host']
-SSH_USER = config['mikrotik']['user'] 
-SSH_PASS = config['mikrotik']['password']
-
-# Metrics
-PING_RTT = Histogram('mikrotik_ping_rtt_seconds', 'RTT distribution buckets (burst pings)', ['target', 'job'],
-                     buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, float('inf')])
-PING_LOSS = Gauge('mikrotik_ping_loss_percent', 'Packet loss %', ['target', 'job'])
-PING_UP = Gauge('mikrotik_ping_up', 'Target is reachable', ['target', 'job'])
-PING_SENT = Gauge('mikrotik_ping_sent_packets', 'Packets sent', ['target', 'job'])
-PING_RECV = Gauge('mikrotik_ping_received_packets', 'Packets received', ['target', 'job'])
-PING_TTL = Gauge('mikrotik_ping_ttl', 'TTL from first packet', ['target', 'job'])
-PING_SIZE = Gauge('mikrotik_ping_size_bytes', 'Packet size', ['target', 'job'])
-PROBE_DURATION = Gauge('mikrotik_probe_duration_seconds', 'Probe duration')
-
-# ✅ FIXED: Info metric for STRING IPs!
-TARGET_IP = Info('mikrotik_target_ip_address', 'Resolved IP address of target', ['target', 'job'])
-
-class MikroTikPingProber:
-    def __init__(self):
-        self.ssh = paramiko.SSHClient()
-        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.lock = threading.Lock()
+# --- SSH Connection Pooling ---
+class MikroTikSSHConnection:
+    def __init__(self, host, user, password):
+        self.host = host
+        self.user = user
+        self.password = password
+        self.ssh = None
         self.connect()
-    
+
     def connect(self):
-        with self.lock:
-            self.ssh.connect(SSH_HOST, username=SSH_USER, password=SSH_PASS)
-    
-    def reconnect_if_needed(self):
         try:
-            transport = self.ssh.get_transport()
-            if not transport or not transport.is_active():
-                self.connect()
-        except:
+            self.ssh = paramiko.SSHClient()
+            self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            self.ssh.connect(self.host, username=self.user, password=self.password, timeout=10)
+            print("SSH connection successful.")
+        except Exception as e:
+            print(f"Error connecting to SSH: {e}")
+            self.ssh = None
+
+    def is_active(self):
+        return self.ssh and self.ssh.get_transport() and self.ssh.get_transport().is_active()
+
+    def exec_command(self, cmd):
+        if not self.is_active():
             self.connect()
-    
-    def resolve_target_ip(self, target):
-        """Resolve domain to IP - updates over time!"""
+        if self.ssh:
+            return self.ssh.exec_command(cmd)
+        raise ConnectionError("SSH connection is not active.")
+
+class MikroTikSSHConnectionPool:
+    def __init__(self, host, user, password, max_connections=10):
+        self.host = host
+        self.user = user
+        self.password = password
+        self.max_connections = max_connections
+        self._pool = queue.Queue(maxsize=max_connections)
+        for _ in range(max_connections):
+            self._pool.put(self._create_connection())
+
+    def _create_connection(self):
+        return MikroTikSSHConnection(self.host, self.user, self.password)
+
+    @contextmanager
+    def connection(self):
+        conn = self._pool.get()
         try:
-            ip = socket.gethostbyname(target)
-            return ip
-        except:
-            return target  # Return original if IP
-    
-    def ping_burst_target(self, target_ip, count=5, burst=10):
-        self.reconnect_if_needed()
-        
+            if not conn.is_active():
+                print("SSH connection was inactive, creating a new one.")
+                conn = self._create_connection()
+            yield conn
+        finally:
+            self._pool.put(conn)
+
+# --- Custom Collector for Dynamic Labels ---
+class MikroTikCollector:
+    def __init__(self):
+        self.probes = {}
+        self._lock = threading.Lock()
+
+    def add_probe_result(self, labels, result):
+        with self._lock:
+            # Use a frozenset of items as the key to handle dict ordering
+            self.probes[frozenset(labels.items())] = result
+
+    def collect(self):
+        with self._lock:
+            for labels, result in self.probes.items():
+                label_dict = dict(labels)
+
+                # RTT
+                rtt_metric = Metric('mikrotik_ping_rtt_seconds', 'Round-trip time', 'gauge')
+                rtt_metric.add_sample('mikrotik_ping_rtt_seconds', value=result['rtt_sec'], labels=label_dict)
+                yield rtt_metric
+
+                # Up
+                up_metric = Metric('mikrotik_ping_up', 'Target is reachable', 'gauge')
+                up_metric.add_sample('mikrotik_ping_up', value=result['up'], labels=label_dict)
+                yield up_metric
+
+                # TTL
+                ttl_metric = Metric('mikrotik_ping_ttl', 'Time-to-live', 'gauge')
+                ttl_metric.add_sample('mikrotik_ping_ttl', value=result['ttl'], labels=label_dict)
+                yield ttl_metric
+
+                # Size
+                size_metric = Metric('mikrotik_ping_size_bytes', 'Packet size', 'gauge')
+                size_metric.add_sample('mikrotik_ping_size_bytes', value=result['size'], labels=label_dict)
+                yield size_metric
+
+                # Target IP Info
+                info_metric = Metric('mikrotik_target_ip_address', 'Resolved IP address of target', 'info')
+                info_metric.add_sample('mikrotik_target_ip_address_info', value={'ip': result['resolved_ip']}, labels=label_dict)
+                yield info_metric
+
+# --- Global Metrics Registry ---
+GLOBAL_REGISTRY = CollectorRegistry()
+PROBE_DURATION = Gauge('mikrotik_probe_duration_seconds', 'Probe duration', registry=GLOBAL_REGISTRY)
+
+# --- Prober ---
+class MikroTikPingProber:
+    def __init__(self, pool):
+        self.pool = pool
+
+    def resolve_target_ip(self, target):
+        try:
+            return socket.gethostbyname(target)
+        except socket.gaierror:
+            print(f"Could not resolve {target}, using target as-is.")
+            return target
+
+    def ping_target(self, target_ip):
         start_time = time.time()
-        interval_ms = max(10, 1000 // burst)
-        with self.lock:
-            cmd = f'/ping {target_ip} count={count} interval={interval_ms}ms'
-            stdin, stdout, stderr = self.ssh.exec_command(cmd)
-            output = stdout.read().decode().strip()
-        
+        cmd = f'/ping {target_ip} count=1'
+
+        output = ""
+        error = ""
+        try:
+            with self.pool.connection() as conn:
+                stdin, stdout, stderr = conn.exec_command(cmd)
+                output = stdout.read().decode().strip()
+                error = stderr.read().decode().strip()
+                if error:
+                    print(f"Error from MikroTik for target {target_ip}: {error}")
+        except ConnectionError as e:
+            print(f"SSH connection error for target {target_ip}: {e}")
+            return self._error_result(duration=time.time() - start_time)
+
         duration = time.time() - start_time
-        
-        # Parse burst: Extract each RTT
-        rtts_sec = []
-        ttl = 0
-        size = 56
-        
-        seq_matches = re.findall(r'^\s*\d+\s+[\d.]+\s+(\d+)\s+(\d+)\s+(\d+)ms', output, re.MULTILINE)
-        for match in seq_matches:
-            size = int(match[0])
-            ttl = int(match[1]) if not ttl else ttl
-            rtt_ms = int(match[2])
-            rtts_sec.append(rtt_ms / 1000.0)
-        
-        # Summary parsing
-        sent_match = re.search(r'sent=(\d+)', output)
-        recv_match = re.search(r'received=(\d+)', output)
-        loss_match = re.search(r'packet-loss=(\d+)%', output)
-        
-        sent = int(sent_match.group(1)) if sent_match else len(seq_matches)
-        recv = int(recv_match.group(1)) if recv_match else len(seq_matches)
-        loss = float(loss_match.group(1)) if loss_match else ((sent - recv) / sent * 100 if sent > 0 else 100.0)
-        up = recv > 0
-        
+        return self._parse_ping_output(output, duration)
+
+    def _parse_ping_output(self, output, duration):
+        # RouterOS v6 Style
+        match_v6 = re.search(r'^\s*\d+\s+[\d.]+\s+(\d+)\s+(\d+)\s+(\d+)ms', output, re.MULTILINE)
+
+        # RouterOS v7 Style
+        rtt_match_v7 = re.search(r'time=(\d+\.?\d*)ms', output)
+        ttl_match_v7 = re.search(r'ttl=(\d+)', output)
+
+        if match_v6 and "ttl-exceeded" not in output:
+            size = int(match_v6.group(1))
+            ttl = int(match_v6.group(2))
+            rtt_sec = float(match_v6.group(3)) / 1000.0
+            up = 1
+        elif rtt_match_v7:
+            rtt_sec = float(rtt_match_v7.group(1)) / 1000.0
+            ttl = int(ttl_match_v7.group(1)) if ttl_match_v7 else 0
+            size = 56  # Default size for v7 style
+            up = 1
+        else:
+            up = 0
+            rtt_sec = 0
+            ttl = 0
+            size = 0
+
+        if "timeout" in output or "no route to host" in output:
+            up = 0
+
         return {
-            'rtts_sec': rtts_sec,
-            'loss': loss,
-            'up': 1 if up else 0,
-            'sent': sent,
-            'recv': recv,
-            'ttl': ttl,
-            'size': size,
-            'duration': duration,
-            'burst_pps': burst
+            'rtt_sec': rtt_sec, 'up': up, 'ttl': ttl, 'size': size,
+            'duration': duration
         }
 
-# HTTP Handler
+    def _error_result(self, duration):
+        return { 'rtt_sec': 0, 'up': 0, 'ttl': 0, 'size': 0, 'duration': duration}
+
+# --- HTTP Handler ---
 class ProbeHandler(BaseHTTPRequestHandler):
-    def __init__(self, prober, *args, **kwargs):
+    def __init__(self, prober, collector, *args, **kwargs):
         self.prober = prober
+        self.collector = collector
         super().__init__(*args, **kwargs)
-    
+
     def do_GET(self):
         if self.path.startswith('/probe'):
             self.handle_probe()
-        else:
+        elif self.path == '/metrics':
             self.handle_metrics()
-    
+        else:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b"<html><body><h1>MikroTik Ping Exporter</h1><p><a href='/metrics'>Metrics</a></p></body></html>")
+
     def handle_probe(self):
         query = parse_qs(urlparse(self.path).query)
         target = query.get('target', [''])[0]
-        count = int(query.get('count', ['10'])[0])
-        burst = int(query.get('burst', ['10'])[0])
-        job = query.get('job', ['mikrotik'])[0]
-        
         if not target:
             self.send_error(400, 'Missing "target" parameter')
             return
-        
+
+        # Extract dynamic labels from query parameters
+        dynamic_labels = {k: v[0] for k, v in query.items() if k not in ['target']}
+
+        resolved_ip = self.prober.resolve_target_ip(target)
+        result = self.prober.ping_target(resolved_ip)
+        result['resolved_ip'] = resolved_ip
+
+        # Create labels for the collector
+        labels = {'target': target, **dynamic_labels}
+        self.collector.add_probe_result(labels, result)
+
+        # Create a temporary registry for this request
+        probe_registry = CollectorRegistry()
+
+        label_keys = ['target'] + list(dynamic_labels.keys())
+        label_values = [target] + list(dynamic_labels.values())
+
+        # Define metrics for the temporary registry
+        ping_rtt_probe = Gauge('mikrotik_ping_rtt_seconds', 'Round-trip time', label_keys, registry=probe_registry)
+        ping_up_probe = Gauge('mikrotik_ping_up', 'Target is reachable', label_keys, registry=probe_registry)
+        ping_ttl_probe = Gauge('mikrotik_ping_ttl', 'Time-to-live', label_keys, registry=probe_registry)
+        ping_size_probe = Gauge('mikrotik_ping_size_bytes', 'Packet size', label_keys, registry=probe_registry)
+        probe_duration_probe = Gauge('mikrotik_probe_duration_seconds', 'Probe duration', registry=probe_registry)
+        target_ip_probe = Info('mikrotik_target_ip_address', 'Resolved IP address of target', label_keys, registry=probe_registry)
+
+        # Populate temporary metrics
+        ping_rtt_probe.labels(*label_values).set(result['rtt_sec'])
+        ping_up_probe.labels(*label_values).set(result['up'])
+        ping_ttl_probe.labels(*label_values).set(result['ttl'])
+        ping_size_probe.labels(*label_values).set(result['size'])
+        probe_duration_probe.set(result['duration'])
+        target_ip_probe.labels(*label_values).info({'ip': resolved_ip})
+
+        PROBE_DURATION.set(result['duration'])
+
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain; version=0.0.4')
         self.end_headers()
-        
-        # ✅ RESOLVE IP (changes over time!)
-        resolved_ip = self.prober.resolve_target_ip(target)
-        
-        result = self.prober.ping_burst_target(resolved_ip, count, burst)
-        
-        # Histogram (accumulates forever)
-        for rtt in result['rtts_sec']:
-            PING_RTT.labels(target=target, job=job).observe(rtt)
-        
-        # Gauges (current values)
-        PING_LOSS.labels(target=target, job=job).set(result['loss'])
-        PING_UP.labels(target=target, job=job).set(result['up'])
-        PING_SENT.labels(target=target, job=job).set(result['sent'])
-        PING_RECV.labels(target=target, job=job).set(result['recv'])
-        PING_TTL.labels(target=target, job=job).set(result['ttl'])
-        PING_SIZE.labels(target=target, job=job).set(result['size'])
-        PROBE_DURATION.set(result['duration'])
-        
-        # ✅ FIXED: Info metric for STRING IPs!
-        TARGET_IP.labels(target=target, job=job).info({'ip': resolved_ip})
-        
-        # Single-line log
+        try:
+            self.wfile.write(generate_latest(probe_registry))
+        except ConnectionAbortedError:
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Client closed connection early for target {target}")
+            return
+
         timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
         status = '🟢' if result['up'] else '🔴'
-        avg_rtt = sum(result['rtts_sec']) / len(result['rtts_sec']) if result['rtts_sec'] else 999
-        interval = 1000 // burst
-        print(f"[{timestamp}] {status} {target:<15} → {resolved_ip:<15} | Burst:{burst}pps({interval}ms) | Pkts:{count} | Avg:{avg_rtt:.3f}s | TTL:{result['ttl']:3} | Loss:{result['loss']:5.1f}% | {result['sent']}/{result['recv']} | ⚡{result['duration']:.2f}s | 📈+{len(result['rtts_sec'])}")
-        
-        self.wfile.write(generate_latest())
-    
+        rtt_ms = result['rtt_sec'] * 1000
+        print(f"[{timestamp}] {status} {target:<15} -> {resolved_ip:<15} | rtt:{rtt_ms:.2f}ms | ttl:{result['ttl']} | size:{result['size']} | dur:{result['duration']:.2f}s")
+
     def handle_metrics(self):
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain; version=0.0.4')
         self.end_headers()
-        self.wfile.write(generate_latest())
-    
+        self.wfile.write(generate_latest(GLOBAL_REGISTRY))
+
     def log_message(self, format, *args):
+        # Suppress routine server logging
         pass
 
-def run_servers(prober, port=9642):
-    server = HTTPServer(('localhost', port), lambda *args: ProbeHandler(prober, *args))
-    print(f"🚀 MikroTik IP RESOLUTION Exporter on :{port}")
-    print("📖 Usage: /probe?target=google.com&count=10&burst=10")
-    server.serve_forever()
+def run_server(prober, collector, port=9642):
+    server_address = ('0.0.0.0', port)
+    httpd = ThreadingHTTPServer(server_address, lambda *args, **kwargs: ProbeHandler(prober, collector, *args, **kwargs))
+    print(f"🚀 MikroTik High-Concurrency Ping Exporter on port {port}")
+    print(f"📖 Usage: http://127.0.0.1:{port}/probe?target=google.com")
+    print(f"📖 Metrics: http://127.0.0.1:{port}/metrics")
+    httpd.serve_forever()
 
 if __name__ == '__main__':
-    print("🚀 Starting MikroTik IP RESOLUTION Ping Exporter...")
-    prober = MikroTikPingProber()
-    run_servers(prober, 9642)
+    parser = argparse.ArgumentParser(description='MikroTik Ping Exporter')
+    parser.add_argument('--host', required=True, help='MikroTik host')
+    parser.add_argument('--user', required=True, help='MikroTik user')
+    parser.add_argument('--password', required=True, help='MikroTik password')
+    parser.add_argument('--port', type=int, default=9642, help='Port to listen on')
+    args = parser.parse_args()
+
+    try:
+        print("🚀 Starting MikroTik Ping Exporter...")
+        collector = MikroTikCollector()
+        GLOBAL_REGISTRY.register(collector)
+        ssh_pool = MikroTikSSHConnectionPool(args.host, args.user, args.password)
+        prober = MikroTikPingProber(ssh_pool)
+        run_server(prober, collector, args.port)
+    except Exception as e:
+        import traceback
+        with open("error.log", "w") as f:
+            f.write(traceback.format_exc())
