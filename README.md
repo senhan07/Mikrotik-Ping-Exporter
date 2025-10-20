@@ -8,6 +8,7 @@ This is a high-performance, concurrent Prometheus exporter for running ping test
 - **Dynamic Labels:** Supports passing arbitrary labels to the exporter via URL parameters, similar to the official Blackbox Exporter.
 - **Command-Line Configuration:** All configuration is done via command-line arguments, making it easy to run in containerized environments.
 - **Robust Parsing:** Compatible with both RouterOS v6 and v7 ping output formats.
+- **SSH Failover:** Supports an alternate host for SSH connections, providing high availability.
 - **Blackbox Style:** Designed to be scraped by Prometheus with a configuration that passes the target as a parameter.
 
 ## Installation
@@ -25,11 +26,22 @@ This is a high-performance, concurrent Prometheus exporter for running ping test
 
 ## Usage
 
-To run the exporter, you must provide the MikroTik's host, user, and password as command-line arguments:
+To run the exporter, you must provide the MikroTik's host, user, and password as command-line arguments. All arguments are documented below:
+
+| Argument | Description | Default |
+|---|---|---|
+| `--host` | The primary IP address of the MikroTik router. | **Required** |
+| `--host.alt` | An alternate IP address for the MikroTik router for failover. | `None` |
+| `--user` | The SSH username for the MikroTik router. | **Required** |
+| `--password` | The SSH password for the MikroTik router. | **Required** |
+| `--port.probe`| The port for the exporter to listen on. | `9642` |
+| `--port.ssh` | The SSH port for the MikroTik router. | `22` |
+| `--sessions` | The number of concurrent SSH sessions in the connection pool. | `10` |
+
+**Example:**
 ```bash
-python3 main.py --host <your-mikrotik-ip> --user <your-ssh-user> --password <your-ssh-password>
+python3 main.py --host 192.168.88.1 --host.alt 192.168.89.1 --user myuser --password mypassword
 ```
-The exporter will start on port `9642` by default. You can change this with the `--port` argument.
 
 ## Prometheus Configuration
 

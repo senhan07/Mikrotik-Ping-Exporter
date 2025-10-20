@@ -13,10 +13,12 @@ from contextlib import contextmanager
 
 # --- SSH Connection Pooling ---
 class MikroTikSSHConnection:
-    def __init__(self, host, user, password):
+    def __init__(self, host, alt_host, user, password, port):
         self.host = host
+        self.alt_host = alt_host
         self.user = user
         self.password = password
+        self.port = port
         self.ssh = None
         self.connect()
 
@@ -24,11 +26,20 @@ class MikroTikSSHConnection:
         try:
             self.ssh = paramiko.SSHClient()
             self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.ssh.connect(self.host, username=self.user, password=self.password, timeout=10)
-            print("SSH connection successful.")
+            self.ssh.connect(self.host, username=self.user, password=self.password, port=self.port, timeout=10)
+            print(f"SSH connection to {self.host} successful.")
         except Exception as e:
-            print(f"Error connecting to SSH: {e}")
-            self.ssh = None
+            print(f"Error connecting to primary host {self.host}: {e}")
+            if self.alt_host:
+                print(f"Trying alternate host {self.alt_host}...")
+                try:
+                    self.ssh.connect(self.alt_host, username=self.user, password=self.password, port=self.port, timeout=10)
+                    print(f"SSH connection to {self.alt_host} successful.")
+                except Exception as e2:
+                    print(f"Error connecting to alternate host {self.alt_host}: {e2}")
+                    self.ssh = None
+            else:
+                self.ssh = None
 
     def is_active(self):
         return self.ssh and self.ssh.get_transport() and self.ssh.get_transport().is_active()
@@ -41,17 +52,19 @@ class MikroTikSSHConnection:
         raise ConnectionError("SSH connection is not active.")
 
 class MikroTikSSHConnectionPool:
-    def __init__(self, host, user, password, max_connections=10):
+    def __init__(self, host, alt_host, user, password, ssh_port, max_connections):
         self.host = host
+        self.alt_host = alt_host
         self.user = user
         self.password = password
+        self.ssh_port = ssh_port
         self.max_connections = max_connections
         self._pool = queue.Queue(maxsize=max_connections)
         for _ in range(max_connections):
             self._pool.put(self._create_connection())
 
     def _create_connection(self):
-        return MikroTikSSHConnection(self.host, self.user, self.password)
+        return MikroTikSSHConnection(self.host, self.alt_host, self.user, self.password, self.ssh_port)
 
     @contextmanager
     def connection(self):
@@ -270,19 +283,22 @@ def run_server(prober, collector, port=9642):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='MikroTik Ping Exporter')
-    parser.add_argument('--host', required=True, help='MikroTik host')
+    parser.add_argument('--host', required=True, help='MikroTik host (primary)')
+    parser.add_argument('--host.alt', help='Alternate MikroTik host (for failover)')
     parser.add_argument('--user', required=True, help='MikroTik user')
     parser.add_argument('--password', required=True, help='MikroTik password')
-    parser.add_argument('--port', type=int, default=9642, help='Port to listen on')
+    parser.add_argument('--port.probe', type=int, default=9642, help='Port for the exporter to listen on')
+    parser.add_argument('--port.ssh', type=int, default=22, help='SSH port for the MikroTik router')
+    parser.add_argument('--sessions', type=int, default=10, help='Number of concurrent SSH sessions')
     args = parser.parse_args()
 
     try:
         print("🚀 Starting MikroTik Ping Exporter...")
         collector = MikroTikCollector()
         GLOBAL_REGISTRY.register(collector)
-        ssh_pool = MikroTikSSHConnectionPool(args.host, args.user, args.password)
+        ssh_pool = MikroTikSSHConnectionPool(args.host, args.host_alt, args.user, args.password, args.port_ssh, args.sessions)
         prober = MikroTikPingProber(ssh_pool)
-        run_server(prober, collector, args.port)
+        run_server(prober, collector, args.port_probe)
     except Exception as e:
         import traceback
         with open("error.log", "w") as f:
